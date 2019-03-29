@@ -1,6 +1,5 @@
 import numpy as np 
 import tensorflow as tf
-from tensorflow.contrib.rnn import BasicLSTMCell
 import time
 from swda_data import load_file
 import os
@@ -72,7 +71,16 @@ def minibatches(data, labels, batch_size):
         end_index = min((batch_num + 1) * batch_size, data_size)
         yield data[start_index: end_index], labels[start_index: end_index]
 
-
+def select(parameters, length):
+    """Select the last valid time step output as the sentence embedding
+    :params parameters: [batch, seq_len, hidden_dims]
+    :params length: [batch]
+    :Returns : [batch, hidden_dims]
+    """
+    shape = tf.shape(parameters)
+    idx = tf.range(shape[0])
+    idx = tf.stack([idx, length - 1], axis = 1)
+    return tf.gather_nd(parameters, idx)
 
 hidden_size_lstm_1 = 200
 hidden_size_lstm_2 = 200
@@ -111,34 +119,40 @@ class DAModel():
             batch_size = s[0] * s[1]
             
             time_step = s[-2]
-           
             word_embeddings = tf.reshape(self.word_embeddings, [batch_size, time_step, word_dim])
             length = tf.reshape(self.utterance_lengths, [batch_size])
 
-            fw = BasicLSTMCell(hidden_size_lstm_1, forget_bias=0.8, state_is_tuple= True)
-            bw = BasicLSTMCell(hidden_size_lstm_1, forget_bias=0.8, state_is_tuple= True)
+            fw = tf.nn.rnn_cell.LSTMCell(hidden_size_lstm_1, forget_bias=0.8, state_is_tuple= True)
+            bw = tf.nn.rnn_cell.LSTMCell(hidden_size_lstm_1, forget_bias=0.8, state_is_tuple= True)
             
-            (output_fw, output_bw), ((fc, fh), (bc, bh)) = tf.nn.bidirectional_dynamic_rnn(fw, bw, word_embeddings,sequence_length=length, dtype = tf.float32)
-            output = tf.concat([output_fw, output_bw], axis = -1)
-            
-            output_ta = tf.TensorArray(dtype = tf.float32, size = 1, dynamic_size = True)
-            
-            def body(time, output_ta_1):
-                if length[time] == 0:
-                    output_ta_1 = output_ta_1.write(time, output[time][0])
-                else:
-                    output_ta_1 = output_ta_1.write(time, output[time][length[time] - 1])
-                return time + 1, output_ta_1
+            output, _ = tf.nn.bidirectional_dynamic_rnn(fw, bw, word_embeddings,sequence_length=length, dtype = tf.float32)
+            output = tf.concat(output, axis = -1) # [batch_size, time_step, dim]
 
-            def condition(time, output_ta_1):
-                return time < batch_size
-
-            i = 0
-            [time, output_ta] = tf.while_loop(condition, body, loop_vars = [i, output_ta])
-            output = output_ta.stack()
-
-            output = tf.reshape(output, [s[0], s[1], 2*hidden_size_lstm_1])
+            # Select the last valid time step output as the utterance embedding, 
+            # this method is more concise than TensorArray with while_loop
+            output = select(output, self.utterance_lengths) # [batch_size, dim]
+            output = tf.reshape(output, s[0], s[1], 2 * hidden_size_lstm_1)
             output = tf.nn.dropout(output, 0.8)
+
+
+            
+            # output_ta = tf.TensorArray(dtype = tf.float32, size = 1, dynamic_size = True)
+            
+            # def body(time, output_ta_1):
+            #     if length[time] == 0:
+            #         output_ta_1 = output_ta_1.write(time, output[time][0])
+            #     else:
+            #         output_ta_1 = output_ta_1.write(time, output[time][length[time] - 1])
+            #     return time + 1, output_ta_1
+
+            # def condition(time, output_ta_1):
+            #     return time < batch_size
+
+            # i = 0
+            # [time, output_ta] = tf.while_loop(condition, body, loop_vars = [i, output_ta])
+            # output = output_ta.stack()
+            # output = tf.reshape(output, [s[0], s[1], 2*hidden_size_lstm_1])
+            # output = tf.nn.dropout(output, 0.8)
         
         with tf.variable_scope("bi-lstm"):
             cell_fw = tf.contrib.rnn.BasicLSTMCell(hidden_size_lstm_2, state_is_tuple = True)
@@ -176,7 +190,7 @@ class DAModel():
         
 
         with tf.variable_scope("viterbi_decode"):
-            viterbi_sequence, viterbi_score = tf.contrib.crf.crf_decode(self.logits, self.trans_params,  self.dialogue_lengths)
+            viterbi_sequence, _ = tf.contrib.crf.crf_decode(self.logits, self.trans_params,  self.dialogue_lengths)
             
 
             batch_size = tf.shape(self.dialogue_lengths)[0]
